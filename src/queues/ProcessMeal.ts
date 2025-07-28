@@ -1,10 +1,15 @@
+import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { eq } from "drizzle-orm";
+import { Readable } from "node:stream";
+import { s3Client } from "../clients/s3Client";
 import { db } from "../db";
 import { mealsTable } from "../db/schema";
-import { transcribeAudio } from "../services/ai";
-import { GetObjectCommand } from "@aws-sdk/client-s3";
-import { s3Client } from "../clients/s3Client";
-import { Readable } from "node:stream";
+import {
+  getMealDetailsFromImage,
+  getMealDetailsFromText,
+  transcribeAudio,
+} from "../services/ai";
 
 export class ProcessMeal {
   static async process({ fileKey }: { fileKey: string }) {
@@ -26,51 +31,86 @@ export class ProcessMeal {
       .where(eq(mealsTable.id, meal.id));
 
     try {
+      let icon = "";
+      let name = "";
+      let foods = [];
+
       if (meal.inputType === "audio") {
-        const command = new GetObjectCommand({
-          Bucket: process.env.BUCKET_NAME,
-          Key: meal.inputFileKey,
+        const audioFileBuffer = await this.downloadAudioFile(meal.inputFileKey);
+        const transcription = await transcribeAudio(audioFileBuffer);
+        console.log("Transcription:", transcription);
+        const mealDetails = await getMealDetailsFromText({
+          createdAt: new Date(),
+          text: transcription,
         });
 
-        const { Body } = await s3Client.send(command);
+        icon = mealDetails.icon;
+        name = mealDetails.name;
+        foods = mealDetails.foods;
 
-        if (!Body || !(Body instanceof Readable)) {
-          throw new Error("Cannot load the audio file!");
+        if (!mealDetails?.name || !Array.isArray(mealDetails.foods)) {
+          throw new Error("mealDetails incompleto ou inválido");
         }
+      }
 
-        const chunks = [];
-        for await (const chunk of Body) {
-          chunks.push(chunk);
-        }
+      if (meal.inputType === "picture") {
+        const imageURL = await this.getImageURL(meal.inputFileKey);
 
-        const audioFileBuffer = Buffer.concat(chunks);
-        const transcription = await transcribeAudio(audioFileBuffer);
-        console.log({ transcription });
+        const mealDetails = await getMealDetailsFromImage({
+          createdAt: meal.createdAt,
+          imageURL,
+        });
+
+        icon = mealDetails.icon;
+        name = mealDetails.name;
+        foods = mealDetails.foods;
       }
 
       await db
         .update(mealsTable)
         .set({
           status: "success",
-          name: "Café da manhã",
-          icon: "🍞",
-          foods: [
-            {
-              name: "Pão",
-              quantity: "2 fatias",
-              calories: 100,
-              proteins: 200,
-              carbohydrates: 300,
-              fats: 400, // ALTERADO!
-            },
-          ],
+          name,
+          icon,
+          foods,
         })
         .where(eq(mealsTable.id, meal.id));
-    } catch {
+    } catch (error) {
+      console.log(error);
+
       await db
         .update(mealsTable)
         .set({ status: "failed" })
         .where(eq(mealsTable.id, meal.id));
     }
+  }
+
+  private static async downloadAudioFile(fileKey: string) {
+    const command = new GetObjectCommand({
+      Bucket: process.env.BUCKET_NAME,
+      Key: fileKey,
+    });
+
+    const { Body } = await s3Client.send(command);
+
+    if (!Body || !(Body instanceof Readable)) {
+      throw new Error("Cannot load the audio file.");
+    }
+
+    const chunks = [];
+    for await (const chunk of Body) {
+      chunks.push(chunk);
+    }
+
+    return Buffer.concat(chunks);
+  }
+
+  private static async getImageURL(fileKey: string) {
+    const command = new GetObjectCommand({
+      Bucket: process.env.BUCKET_NAME,
+      Key: fileKey,
+    });
+
+    return getSignedUrl(s3Client, command, { expiresIn: 600 });
   }
 }
